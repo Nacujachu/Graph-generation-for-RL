@@ -24,6 +24,8 @@ class MVC_environement():
             g = self.get_torch_dense()
             return torch.from_numpy(self.Xv).type(torch.DoubleTensor) , g
 
+    def get_lap_torch(self):
+        return torch.from_numpy(nx.normalized_laplacian_matrix(self.nx_graph).toarray()).unsqueeze(0)
     
     def take_action(self,v):
         self.Xv[0,v] = 1
