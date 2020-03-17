@@ -3,6 +3,8 @@ import torch.nn as nn
 import networkx as nx
 import numpy as np
 from collections import namedtuple
+from torch.autograd import Variable
+
 import random
 import math
 import warnings
@@ -125,18 +127,19 @@ class replay_buffer():
         
         return self.buffer[[batch]]
 
-
+    def clear_buffer(self):
+        self.size = 0
 
 class Agent(nn.Module):
-    def __init__(self , emb_dim = 64 , T = 4,device = 'cuda:0' , init_factor = 10 , w_scale = 0.01 , init_method = 'normal' , replay_size = 500000):
+    def __init__(self , emb_dim = 64 , T = 4,device = 'cuda:0' , init_factor = 10 , w_scale = 0.01 , init_method = 'normal' , replay_size = 500000 , PG = False):
         
 
         super().__init__()
 
-        torch.cuda.manual_seed_all(19960214)
-        torch.manual_seed(19960214)
-        np.random.seed(19960214)
-        random.seed(19960214)
+        #torch.cuda.manual_seed_all(19960214)
+        #torch.manual_seed(19960214)
+        #np.random.seed(19960214)
+        #random.seed(19960214)
 
         self.dqn =\
          embedding_network(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method).double().to(device)
@@ -160,27 +163,67 @@ class Agent(nn.Module):
         self.EPS_DECAY = 10000
         self.N = 0
         self.N_STEP = 2
+        self.PG = PG
+        self.non_selected = []
+        self.selected = []
+
+        if PG:
+            self.log_probs = []
+            self.rewards = []
+            self.actions = []
+            self.dones = []
+            self.softmax = torch.nn.Softmax(dim = 1)
     def forward(self , graph , Xv ):
         
         if self.device != None:
             graph = graph.to(self.device)
             Xv = Xv.to(self.device)
-
-        return self.dqn(graph , Xv)
+        
+        if self.PG:
+            select_index = (Xv[0].long() == 1).view(-1)
+            out = self.dqn(graph , Xv)
+            out[0][select_index] = -float('inf')
+            return self.softmax(out)
+        else:
+            return self.dqn(graph , Xv)
 
     def new_epsiode(self):
         self.N = 0
-    def take_action(self , graph , Xv , selected , non_selected):
-        eps_threshold = self.EPS_END + (self.EPS_START - self.EPS_END) * \
-        math.exp(-1. * self.steps_done / self.EPS_DECAY)
-        if np.random.uniform() > eps_threshold:
+        self.selected = []
+
+
+
+    def take_action(self , graph , Xv , is_validation = False):
+        if self.PG:
             val = self.forward(graph , Xv)[0]
-            val[selected] = -float('inf')
-            action = int(torch.argmax(val).item())
+            m = torch.distributions.categorical.Categorical(probs = val)
+            action = m.sample()
+            if(is_validation == False):
+                self.actions.append(action)
+                self.log_probs.append(m.log_prob(action))
+                
+            else:
+                self.selected.append(action)
+            return action.item()
         else:
-            action = int(np.random.choice(non_selected))
-        
-        
+            if(len(self.selected) == 0):
+                self.non_selected = [i for i in range(graph.shape[1])]
+
+            eps_threshold = self.EPS_END + (self.EPS_START - self.EPS_END) * \
+            math.exp(-1. * self.steps_done / self.EPS_DECAY)
+            if np.random.uniform() > eps_threshold or is_validation:
+                select_index = (Xv[0].long() == 1).view(-1)
+                val = self.forward(graph , Xv)[0]
+                val[self.selected] = -float('inf')
+                action = int(torch.argmax(val).item())
+                self.selected.append(action)
+                self.non_selected.remove(action)
+            else:
+                action = int(np.random.choice(non_selected))
+                self.non_selected.remove(action)
+                self.selected.append(action)
+            self.steps_done = self.steps_done + 1
+            return action
     def get_val_result(self, validation_graph):
 
         objective_vals = []
@@ -192,63 +235,99 @@ class Agent(nn.Module):
             Xv = Xv.cuda()
             graph = graph.to(self.device)
             done = False
-            non_selected = list(np.arange(env.num_nodes))
-            selected = []
+            self.non_selected = list(np.arange(env.num_nodes))
+            self.selected = []
             while done == False:
                 #Xv = Xv.cuda()
                 Xv = Xv.to(self.device)
-                val = self.forward(graph , Xv)[0]
-                val[selected] = -float('inf')
-                action = int(torch.argmax(val).item())
+                #val = self.forward(graph , Xv)[0]
+                #val[selected] = -float('inf')
+                #action = int(torch.argmax(val).item())
+                action = self.take_action(graph , Xv , is_validation = True)
+                
                 Xv_next , reward , done = env.take_action(action)
-                non_selected.remove(action)
-                selected.append(action)
+                #non_selected.remove(action)
+                #selected.append(action)
                 Xv = Xv_next
             #print(selected)
-            objective_vals.append(len(selected))
+            objective_vals.append(len(self.selected))
         return sum(objective_vals)/len(objective_vals)
     
     def store_transition(self , new_exp):
         self.buffer.push(new_exp)
 
-    def train(self , batch_size = 64) :
-        if(self.buffer.size < batch_size):
-            return 
-        
-        batch = self.buffer.sample(batch_size)
-        batch = experience(*zip(*batch))
-        batch_graph = torch.cat(batch.graph)
-        batch_state = torch.cat(batch.Xv)
-        batch_action = torch.cat(batch.action)
-        batch_reward = torch.cat(batch.reward).double()
-        batch_next_state = torch.cat(batch.next_Xv)
-        non_final_mask = torch.tensor(tuple(map(lambda s : s is not True, batch.is_done)),dtype = torch.uint8)
+    def train(self , batch_size = 64 , fitted_Q = False) :
+        if self.PG:
+            R = 0
+            rewards_list = []
+            for r , d in zip(self.rewards , self.dones):
+                R = r + R
+                rewards_list.insert(0 , R)
+                if(d):
+                    R = 0
+            #print(rewards_list)
+            rewards = torch.FloatTensor(rewards_list)
+            rewards = (rewards - rewards.mean()) / (rewards.std() + np.finfo(np.float32).eps)
+            probs = torch.Tensor(self.log_probs).to(self.device)
+            rewards = rewards.to(self.device)
+            
+            loss = 0
 
-        non_final_graph = batch_graph[non_final_mask]
-        non_final_next_state = batch_next_state[non_final_mask]
+            for lgp , r in zip(self.log_probs , rewards):
+                loss += -lgp*r
 
-        next_state_value = torch.zeros(batch_size).detach().double()
-        if self.device == None:
-            self.device = 'cuda:0'
-        device = self.device
-        batch_graph = batch_graph.to(device)
-        batch_state = batch_state.to(device)
-        batch_action = batch_action.to(device)
-        batch_reward = batch_reward.to(device)
-        batch_next_state = batch_next_state.to(device)
-        next_state_value = next_state_value.to(device)
-        non_final_graph = non_final_graph.to(device)
-        non_final_next_state = non_final_next_state.to(device)
+            # print(loss)
 
-        pred_q = self.dqn(batch_graph , batch_state ).gather(1 , batch_action.view(-1,1)).view(-1)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
 
-        
-        next_state_value[non_final_mask] = self.target_net(non_final_graph , non_final_next_state).max(1)[0].detach()
-        expected_q = next_state_value + batch_reward
-        loss = self.loss_func(pred_q , expected_q)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+            self.rewards = [] 
+            self.dones = []
+            self.log_probs = []
+        else:
+
+            if(self.buffer.size < batch_size):
+                return 
+            
+            batch = self.buffer.sample(batch_size)
+            batch = experience(*zip(*batch))
+            batch_graph = torch.cat(batch.graph)
+            batch_state = torch.cat(batch.Xv)
+            batch_action = torch.cat(batch.action)
+            batch_reward = torch.cat(batch.reward).double()
+            batch_next_state = torch.cat(batch.next_Xv)
+            non_final_mask = torch.tensor(tuple(map(lambda s : s is not True, batch.is_done)),dtype = torch.uint8)
+
+            non_final_graph = batch_graph[non_final_mask]
+            non_final_next_state = batch_next_state[non_final_mask]
+
+            next_state_value = torch.zeros(batch_size).detach().double()
+            if self.device == None:
+                self.device = 'cuda:0'
+            device = self.device
+            batch_graph = batch_graph.to(device)
+            batch_state = batch_state.to(device)
+            batch_action = batch_action.to(device)
+            batch_reward = batch_reward.to(device)
+            batch_next_state = batch_next_state.to(device)
+            next_state_value = next_state_value.to(device)
+            non_final_graph = non_final_graph.to(device)
+            non_final_next_state = non_final_next_state.to(device)
+
+            pred_q = self.dqn(batch_graph , batch_state ).gather(1 , batch_action.view(-1,1)).view(-1)
+
+            if (fitted_Q):
+                next_state_value[non_final_mask] = self.dqn(non_final_graph , non_final_next_state).max(1)[0].detach()
+                self.buffer.clear_buffer()
+            else:
+                next_state_value[non_final_mask] = self.target_net(non_final_graph , non_final_next_state).max(1)[0].detach()
+            expected_q = next_state_value + batch_reward
+            loss = self.loss_func(pred_q , expected_q)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
 
     def update_target_network(self):
         self.target_net.load_state_dict(self.dqn.state_dict())
@@ -257,5 +336,12 @@ class Agent(nn.Module):
     def save_weights(self , file_name):
         torch.save(self.dqn.state_dict() , file_name)
 
-    def load_weights(self , file_name):
-        self.dqn.load_state_dict(torch.load(file_name))
+    def load_weights(self , file_name = None ,state_dict = None):
+        
+        if file_name == None and state_dict == None:
+            print('no state to load')
+
+        if state_dict is not None:
+            self.dqn.load_state_dict(state_dict)
+        else:
+            self.dqn.load_state_dict(torch.load(file_name))

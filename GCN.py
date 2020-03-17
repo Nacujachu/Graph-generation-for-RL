@@ -44,7 +44,7 @@ class GCN_layer(nn.Module):
             #out2 = out2.cpu().to_dense().cuda()
             out2= torch.matmul(out2 , self.theta2)
         else:
-            print( lap.type() , input_feature.type())
+            #print( lap.type() , input_feature.type())
             out2 = torch.matmul(lap , input_feature) 
             out2 = torch.matmul(out2,self.theta2)
         return out1 + out2
@@ -56,9 +56,9 @@ class GCN_network(nn.Module):
         super().__init__()
         self.gcn_in = GCN_layer(in_feature,out_feature , device = device)
         self.relu = nn.ReLU()
-        hidden_gcn = [GCN_layer(out_feature,out_feature) for i in range(n_hidden_layer)]
+        hidden_gcn = [GCN_layer(out_feature,out_feature,device) for i in range(n_hidden_layer)]
         self.gcns = nn.Sequential(*hidden_gcn)
-        self.gcn_out = GCN_layer(out_feature , out_feature)
+        self.gcn_out = GCN_layer(out_feature , out_feature,device)
         self.in_feature = in_feature
         self.device = device
 
@@ -71,10 +71,11 @@ class GCN_network(nn.Module):
         x = self.gcn_in(graph_lap , X)
         x = self.relu(x)
         for layer in self.gcns:
+            
             x = layer(graph_lap , x)
             x = self.relu(x)
         out = self.gcn_out(graph_lap,x)
         out = torch.mean(out , dim = 1)
-        print(out.shape)
+        #print(out.shape)
         return out
 

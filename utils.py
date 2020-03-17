@@ -4,6 +4,7 @@ import networkx as nx
 import pickle
 import random
 import math
+import torch
 def pickle_save(data,file_name):
     with open(file_name,'wb') as f:
         pickle.dump(data , f)
@@ -31,6 +32,8 @@ def validation_graph_gen(n , p , num = 100, graph_type = 'er'):
             
     return validation_graph
 
+def get_lap_torch(g):
+    return torch.from_numpy(nx.normalized_laplacian_matrix(g).toarray()).unsqueeze(0)
 
 def validation(dqn , validation_graph , device = 'cuda:0'):
     objective_vals = []
@@ -70,7 +73,7 @@ def is_vertex_cover(graph , cover):
             
     return cover_edge == total_edge
 
-def mvc_bb(graph , UB = 0 , C = []):
+def mvc_bb(graph , UB = 9999999 , C = []):
     
     def DegLB():
     
