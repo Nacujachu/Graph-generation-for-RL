@@ -4,7 +4,7 @@ import networkx as nx
 import numpy as np
 from collections import namedtuple
 from torch.autograd import Variable
-
+from GCN import GCN_network
 import random
 import math
 import warnings
@@ -30,6 +30,77 @@ def to_sparse_tensor(x):
         sparse1 = torch.sparse.FloatTensor(indices, values, x.size())
         return sparse1
 
+
+class embedding_network_conditional(nn.Module):
+    def __init__(self , emb_dim = 64 , T = 4,device = None , init_factor = 10 , w_scale = 0.01 , init_method = 'normal'):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.T = T
+        self.W1 = nn.Linear( 1 , emb_dim , bias = False)
+        self.W2 = nn.Linear(emb_dim , emb_dim , bias = False)
+        self.W3 = nn.Linear(emb_dim , emb_dim , bias = False)
+        self.W4 = nn.Linear( 1 , emb_dim , bias = False)
+        self.W5 = nn.Linear(emb_dim*3,1 , bias = False)
+        self.W6 = nn.Linear(emb_dim , emb_dim , bias = False)
+        self.W7 = nn.Linear(emb_dim , emb_dim , bias = False)
+        self.global_net = GCN_network(in_feature = 16 , out_feature = emb_dim , n_hidden_layer = 2 , device = device)
+        std = 1/np.sqrt(emb_dim)/init_factor
+        
+        for W in [self.W1 , self.W2 , self.W3 , self.W4 , self.W5 , self.W6 , self.W7]:
+            if init_method == 'normal':
+                nn.init.normal_(W.weight , 0.0 , w_scale)
+            else:
+                nn.init.uniform_(W.weight , -std , std)
+        self.device = device
+        self.relu = nn.ReLU()
+        
+    def forward(self , graph , Xv ):
+        
+        if len(graph.size()) == 2:
+            graph = torch.unsqueeze(graph,  0)
+    
+        device = self.device
+        batch_size = Xv.shape[0]
+        n_vertex = Xv.shape[1]
+        graph_edge = torch.unsqueeze(graph , 3)
+        
+        global_embedding = self.global_net(graph)
+        #print(global_embedding.shape)
+        emb_matrix = torch.zeros([batch_size , n_vertex , self.emb_dim ]).type(torch.DoubleTensor)
+        
+        if 'cuda' in Xv.type():
+            if device == None:
+                emb_matrix = emb_matrix.cuda()
+            else:
+                emb_matrix = emb_matrix.cuda(device)
+        for t in range(self.T):
+            neighbor_sum = torch.bmm(graph , emb_matrix )
+            v1 = self.W1(Xv)
+            v2 = self.W2(neighbor_sum)
+            v3 = self.W4(graph_edge)
+            v3 = self.W3(torch.sum(v3 , 2))
+            
+            v = v1 + v2 + v3
+            #emb_matrix = v.clone()
+            emb_matrix = self.relu(v)
+            #print(v1 , v2 , v3)
+            #print('=================')
+            #print(v[0][0])
+        #print(emb_matrix.shape)
+        emb_sum = torch.sum(emb_matrix , 1)
+        #print(emb_sum.shape)
+        
+        v6 = self.W6(emb_sum)
+        v6 = v6.repeat(1,n_vertex )
+        v6 = v6.view(batch_size , n_vertex , self.emb_dim)
+
+        glob = global_embedding.repeat(1 , n_vertex)
+        glob = glob.view(batch_size , n_vertex , self.emb_dim)
+
+        v7 = self.W7(emb_matrix)
+        ct = self.relu(torch.cat([v6 , v7 , glob] , 2))
+        #print(ct.shape)
+        return torch.squeeze(self.W5(ct) , 2)
 
 class embedding_network(nn.Module):
     
@@ -86,15 +157,14 @@ class embedding_network(nn.Module):
             v2 = self.W2(neighbor_sum)
             v3 = self.W4(graph_edge)
             v3 = self.W3(torch.sum(v3 , 2))
-            
             v = v1 + v2 + v3
-            #emb_matrix = v.clone()
             emb_matrix = self.relu(v)
-            #print(v1 , v2 , v3)
-            #print('=================')
-            #print(v[0][0])
-        #print(emb_matrix.shape)
+
+        
         emb_sum = torch.sum(emb_matrix , 1)
+
+
+        
         v6 = self.W6(emb_sum)
         v6 = v6.repeat(1,n_vertex )
         v6 = v6.view(batch_size , n_vertex , self.emb_dim)
@@ -131,7 +201,8 @@ class replay_buffer():
         self.size = 0
 
 class Agent(nn.Module):
-    def __init__(self , emb_dim = 64 , T = 4,device = 'cuda:0' , init_factor = 10 , w_scale = 0.01 , init_method = 'normal' , replay_size = 500000 , PG = False):
+    def __init__(self , emb_dim = 64 , T = 4,device = 'cuda:0' , init_factor = 10 , w_scale = 0.01 , init_method = 'normal' , 
+    replay_size = 500000 , PG = False , global_net = False):
         
 
         super().__init__()
@@ -140,11 +211,16 @@ class Agent(nn.Module):
         #torch.manual_seed(19960214)
         #np.random.seed(19960214)
         #random.seed(19960214)
-
-        self.dqn =\
-         embedding_network(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method).double().to(device)
-        self.target_net = \
-        embedding_network(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method).double().to(device)
+        if global_net:
+            self.dqn =\
+            embedding_network_conditional(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method).double().to(device)
+            self.target_net = \
+            embedding_network_conditional(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method).double().to(device)
+        else:
+            self.dqn =\
+            embedding_network(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method).double().to(device)
+            self.target_net = \
+            embedding_network(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method).double().to(device)
 
         self.target_net.load_state_dict(self.dqn.state_dict())
 
@@ -324,6 +400,9 @@ class Agent(nn.Module):
                 next_state_value[non_final_mask] = self.target_net(non_final_graph , non_final_next_state).max(1)[0].detach()
             expected_q = next_state_value + batch_reward
             loss = self.loss_func(pred_q , expected_q)
+
+            print(loss)
+
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
