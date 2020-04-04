@@ -10,6 +10,8 @@ import warnings
 from utils import validation 
 from MVC_env import MVC_environement
 from utils import mvc_bb
+import torch.utils.data as Data
+
 warnings.filterwarnings("ignore")
 
 
@@ -35,7 +37,7 @@ class gnn_predict_network(nn.Module):
 
 class training_data_generator():
     
-    def __init__(self , original_graph_distribution = ('er' , 0.15) , T = 5 , K = 100 , N = 50 , train_epoch = 50 , num_hint = 5, device = 'cuda:0'):
+    def __init__(self , original_graph_distribution = ('er' , 0.15) , T = 5 , K = 100 , N = 50 , train_epoch = 10 , num_hint = 10, device = 'cuda:0'):
         '''
         T iterations
         K graph per iteration
@@ -50,6 +52,7 @@ class training_data_generator():
         self.N = N
         self.graph_list = []
         self.ground_truth = []
+        self.device = device
         graph_type , p = original_graph_distribution
         for _ in range(K):
             if graph_type == 'er':
@@ -62,18 +65,19 @@ class training_data_generator():
         self.population = self.graph_list[:]
         self.gnn_net = gnn_predict_network(device = device).to(device)
 
-
+    
 
     def network_train(self):
         
-
+        loss_fn = torch.nn.BCELoss()
+        optimizer = torch.optim.Adam(self.gnn_net.parameters() , lr = 2e-3)
 
         
         cur_graphs = self.population[:]
         cur_target = []
-        training_target = []
+        training_targets = []
         training_graphs = []
-        training_feature = []
+        training_features = []
         for g in cur_graphs:
             sol = mvc_bb(g)
             env = MVC_environement(g)
@@ -82,13 +86,31 @@ class training_data_generator():
             graph = torch.unsqueeze(graph , 0)
             training_graphs.append(graph)
             Xv[0,[idx],0] = 1
-            training_feature.append(Xv)
+            training_features.append(Xv)
             ans = torch.zeros_like(Xv).squeeze(2)
             ans[0,sol] = 1
-            training_target.append(ans)
+            training_targets.append(ans)
 
         training_graphs = torch.cat(training_graphs , 0)
-        training_target = torch.cat(training_target , 0)
-        training_feature = torch.cat(training_feature , 0)
-        print(training_graphs.shape , training_target.shape, training_feature.shape)
+        training_targets = torch.cat(training_targets , 0)
+        training_features = torch.cat(training_features , 0)
+        print(training_graphs.shape , training_targets.shape, training_features.shape)
 
+        dtset = Data.TensorDataset(training_graphs , training_features , training_targets)
+        loader = Data.DataLoader(dataset = dtset , batch_size = 16 , shuffle = True)
+        losses_list = []
+        for e in range(self.train_epoch):
+            loss_sum = 0
+            for graphs , Xvs , y in loader:
+                print(graphs.shape , Xvs.shape , y.shape)
+                graphs = graphs.to(self.device)
+                Xvs = Xvs.to(self.device)
+                y = y.to(self.device)
+                out = self.gnn_net(graphs,Xvs)
+                loss = loss_fn(out , y)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                loss_sum += loss.item()
+            losses_list.append(loss_sum)
+        return losses_list
