@@ -177,6 +177,7 @@ class embedding_network(nn.Module):
 
 experience = namedtuple("experience" , ['graph','Xv','action','reward','next_Xv','is_done'])
 fitted_q_exp = namedtuple("fitted_exp" , ['graph','Xv','action','reward'])
+
 class replay_buffer():
     def __init__(self , max_size):
         self.buffer = np.zeros(  [max_size],dtype = experience)
@@ -202,7 +203,7 @@ class replay_buffer():
 
 class Agent(nn.Module):
     def __init__(self , emb_dim = 64 , T = 4,device = 'cuda:0' , init_factor = 10 , w_scale = 0.01 , init_method = 'normal' , 
-    replay_size = 500000 , PG = False , global_net = False):
+    replay_size = 500000 , PG = False , global_net = False , fitted_Q = True):
         
 
         super().__init__()
@@ -226,7 +227,7 @@ class Agent(nn.Module):
 
         self.buffer = replay_buffer(replay_size)
         ##
-        self.optimizer = torch.optim.Adam( self.dqn.parameters() , lr=0.0001 , amsgrad=False)
+        self.optimizer = torch.optim.Adam( self.dqn.parameters() , lr=1e-4 , amsgrad=False)
 
         self.loss_func = torch.nn.MSELoss()
 
@@ -242,7 +243,8 @@ class Agent(nn.Module):
         self.PG = PG
         self.non_selected = []
         self.selected = []
-
+        self.fitted_Q = fitted_Q
+        self.episode_done = 0
         if PG:
             self.log_probs = []
             self.rewards = []
@@ -287,6 +289,7 @@ class Agent(nn.Module):
 
             eps_threshold = self.EPS_END + (self.EPS_START - self.EPS_END) * \
             math.exp(-1. * self.steps_done / self.EPS_DECAY)
+
             if np.random.uniform() > eps_threshold or is_validation:
                 select_index = (Xv[0].long() == 1).view(-1)
                 val = self.forward(graph , Xv)[0]
@@ -295,7 +298,7 @@ class Agent(nn.Module):
                 self.selected.append(action)
                 self.non_selected.remove(action)
             else:
-                action = int(np.random.choice(non_selected))
+                action = int(np.random.choice(self.non_selected))
                 self.non_selected.remove(action)
                 self.selected.append(action)
             self.steps_done = self.steps_done + 1
@@ -331,6 +334,8 @@ class Agent(nn.Module):
     
     def store_transition(self , new_exp):
         self.buffer.push(new_exp)
+    
+    
 
     def train(self , batch_size = 64 , fitted_Q = False) :
         if self.PG:
@@ -362,7 +367,6 @@ class Agent(nn.Module):
             self.dones = []
             self.log_probs = []
         else:
-
             if(self.buffer.size < batch_size):
                 return 
             
@@ -407,6 +411,46 @@ class Agent(nn.Module):
             loss.backward()
             self.optimizer.step()
 
+
+
+    def train_with_graph(self , g ):
+
+        '''
+        g: networkx graph
+        '''
+        N_STEP = 2
+        env = MVC_environement(g)
+        Xv , graph = env.reset_env()
+        Xv = Xv.clone()
+        graph = torch.unsqueeze(graph,  0)
+        done = False
+        fitted_experience_list = []
+        reward_list = []
+        self.non_selected = list(np.arange(env.num_nodes))
+        self.new_epsiode()
+        while done == False:
+            action = self.take_action(graph , Xv)
+            Xv_next , reward , done = env.take_action(action)
+            Xv_next = Xv_next.clone()
+            fit_ex = fitted_q_exp(graph , Xv , action , reward)
+            fitted_experience_list.append(fit_ex)
+            self.N += 1 
+            reward_list.append(reward)
+            if self.N >= N_STEP:
+                n_reward = sum(reward_list)
+                n_prev_ex = fitted_experience_list[0]
+                n_graph = n_prev_ex.graph
+                n_Xv = n_prev_ex.Xv
+                n_action = n_prev_ex.action
+                ex = experience(n_graph , n_Xv , torch.tensor([n_action]) , torch.tensor([n_reward]) , Xv_next , done)
+                self.store_transition(ex)
+                fitted_experience_list.pop(0)
+                reward_list.pop(0)
+            
+            self.train()
+        self.episode_done += 1
+        if  self.episode_done > 0 and self.episode_done %5 == 0:
+            self.update_target_network()
 
     def update_target_network(self):
         self.target_net.load_state_dict(self.dqn.state_dict())
