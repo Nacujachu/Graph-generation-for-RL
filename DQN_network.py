@@ -104,7 +104,13 @@ class embedding_network_conditional(nn.Module):
 
 class embedding_network(nn.Module):
     
-    def __init__(self , emb_dim = 64 , T = 4,device = None , init_factor = 10 , w_scale = 0.01 , init_method = 'normal'):
+    def __init__(self , emb_dim = 64 , T = 4,device = None , init_factor = 10 , w_scale = 0.01 , init_method = 'normal' , fix_seed = True):
+        if fix_seed:
+            torch.cuda.manual_seed_all(19960214)
+            torch.manual_seed(19960214)
+            np.random.seed(19960214)
+            random.seed(19960214)
+
         super().__init__()
         self.emb_dim = emb_dim
         self.T = T
@@ -202,32 +208,32 @@ class replay_buffer():
         self.size = 0
 
 class Agent(nn.Module):
-    def __init__(self , emb_dim = 64 , T = 4,device = 'cuda:0' , init_factor = 10 , w_scale = 0.01 , init_method = 'normal' , 
-    replay_size = 500000 , PG = False , global_net = False , fitted_Q = True):
+    def __init__(self , emb_dim = 64 , T = 5,device = 'cuda:0' , init_factor = 10 , w_scale = 0.01 , init_method = 'normal' , 
+    replay_size = 500000 , PG = False , global_net = False , fitted_Q = True , fix_seed = True , lr = 1e-4):
         
 
         super().__init__()
-
-        #torch.cuda.manual_seed_all(19960214)
-        #torch.manual_seed(19960214)
-        #np.random.seed(19960214)
-        #random.seed(19960214)
+        if fix_seed:
+            torch.cuda.manual_seed_all(19960214)
+            torch.manual_seed(19960214)
+            np.random.seed(19960214)
+            random.seed(19960214)
         if global_net:
             self.dqn =\
-            embedding_network_conditional(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method).double().to(device)
+            embedding_network_conditional(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method,fix_seed = fix_seed).double().to(device)
             self.target_net = \
-            embedding_network_conditional(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method).double().to(device)
+            embedding_network_conditional(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method,fix_seed = fix_seed ).double().to(device)
         else:
             self.dqn =\
-            embedding_network(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method).double().to(device)
+            embedding_network(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method, fix_seed = fix_seed).double().to(device)
             self.target_net = \
-            embedding_network(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method).double().to(device)
+            embedding_network(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method , fix_seed = fix_seed).double().to(device)
 
         self.target_net.load_state_dict(self.dqn.state_dict())
 
         self.buffer = replay_buffer(replay_size)
         ##
-        self.optimizer = torch.optim.Adam( self.dqn.parameters() , lr=1e-4 , amsgrad=False)
+        self.optimizer = torch.optim.Adam( self.dqn.parameters() , lr = lr , amsgrad=False)
 
         self.loss_func = torch.nn.MSELoss()
 
@@ -289,8 +295,11 @@ class Agent(nn.Module):
 
             eps_threshold = self.EPS_END + (self.EPS_START - self.EPS_END) * \
             math.exp(-1. * self.steps_done / self.EPS_DECAY)
-
-            if np.random.uniform() > eps_threshold or is_validation:
+            rand_val = np.random.uniform()
+            if is_validation:
+                rand_val = 999
+            #print(is_validation , rand_val)
+            if  rand_val > eps_threshold  :
                 select_index = (Xv[0].long() == 1).view(-1)
                 val = self.forward(graph , Xv)[0]
                 val[self.selected] = -float('inf')
@@ -298,10 +307,12 @@ class Agent(nn.Module):
                 self.selected.append(action)
                 self.non_selected.remove(action)
             else:
+                #print(self.non_selected)
                 action = int(np.random.choice(self.non_selected))
                 self.non_selected.remove(action)
                 self.selected.append(action)
-            self.steps_done = self.steps_done + 1
+            if(is_validation == False):
+                self.steps_done = self.steps_done + 1
             return action
     def get_val_result(self, validation_graph):
 
@@ -319,8 +330,9 @@ class Agent(nn.Module):
             while done == False:
                 #Xv = Xv.cuda()
                 Xv = Xv.to(self.device)
-                #val = self.forward(graph , Xv)[0]
+                val = self.forward(graph , Xv)[0]
                 #val[selected] = -float('inf')
+                print(val)
                 #action = int(torch.argmax(val).item())
                 action = self.take_action(graph , Xv , is_validation = True)
                 
@@ -332,6 +344,52 @@ class Agent(nn.Module):
             objective_vals.append(len(self.selected))
         return sum(objective_vals)/len(objective_vals)
     
+    def get_val_result_batch(self , validation_graph):
+        N = len(validation_graph)
+        all_graphs = []
+        all_Xv = []
+        all_envs = []
+        for g in validation_graph:
+            env = MVC_environement(g)
+            all_envs.append(env)
+            Xv , graph = env.reset_env()
+            graph = torch.unsqueeze(graph,  0)
+            all_graphs.append(graph)
+            all_Xv.append(Xv)
+        all_graphs = torch.cat(all_graphs , 0).to(self.device)
+        all_Xv = torch.cat(all_Xv , 0).to(self.device)
+        all_selected = [[] for _ in range(N)]
+        all_dones = [False for _ in range(N)]
+        all_done = False
+        done_count = 0
+        while all_done == False:
+            q_val = self.dqn(all_graphs , all_Xv )
+            for i in range(N):
+
+                if all_dones[i]:
+                    continue
+
+                q_val[i][ all_selected[i] ] = -float('inf')
+                action = torch.argmax(q_val[i]).item()
+                all_selected[i].append(action)
+                _,_,done = all_envs[i].take_action(action)
+                all_Xv[i][action] = 1
+                if done:
+                    all_dones[i] = True
+                    done_count += 1
+            if(done_count == N):
+                break
+            #print(all_Xv)
+            #print(q_val.shape)
+            #del all_graphs
+            #del all_Xv
+            #break
+        objective_vals = []
+        for s in all_selected:
+            objective_vals.append(len(s))
+        return sum(objective_vals)/len(objective_vals)
+        #del all_graphs,all_Xv
+
     def store_transition(self , new_exp):
         self.buffer.push(new_exp)
     
@@ -397,15 +455,16 @@ class Agent(nn.Module):
 
             pred_q = self.dqn(batch_graph , batch_state ).gather(1 , batch_action.view(-1,1)).view(-1)
 
-            if (fitted_Q):
+            if self.fitted_Q:
                 next_state_value[non_final_mask] = self.dqn(non_final_graph , non_final_next_state).max(1)[0].detach()
-                self.buffer.clear_buffer()
+                #self.buffer.clear_buffer()
             else:
                 next_state_value[non_final_mask] = self.target_net(non_final_graph , non_final_next_state).max(1)[0].detach()
+
             expected_q = next_state_value + batch_reward
             loss = self.loss_func(pred_q , expected_q)
 
-            print(loss)
+            #print(loss)
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -426,9 +485,12 @@ class Agent(nn.Module):
         done = False
         fitted_experience_list = []
         reward_list = []
+        #self.new_epsiode()
         self.non_selected = list(np.arange(env.num_nodes))
-        self.new_epsiode()
+        self.selected = []
+        self.N = 0
         while done == False:
+            
             action = self.take_action(graph , Xv)
             Xv_next , reward , done = env.take_action(action)
             Xv_next = Xv_next.clone()
@@ -446,10 +508,11 @@ class Agent(nn.Module):
                 self.store_transition(ex)
                 fitted_experience_list.pop(0)
                 reward_list.pop(0)
-            
+            Xv = Xv_next
             self.train()
         self.episode_done += 1
-        if  self.episode_done > 0 and self.episode_done %5 == 0:
+        if  self.episode_done > 0 and self.episode_done %8 == 0:
+            #print(self.steps_done)
             self.update_target_network()
 
     def update_target_network(self):
