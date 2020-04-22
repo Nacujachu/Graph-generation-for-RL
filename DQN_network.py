@@ -206,10 +206,10 @@ class replay_buffer():
 
     def clear_buffer(self):
         self.size = 0
-
+        self.idx = -1
 class Agent(nn.Module):
     def __init__(self , emb_dim = 64 , T = 5,device = 'cuda:0' , init_factor = 10 , w_scale = 0.01 , init_method = 'normal' , 
-    replay_size = 500000 , PG = False , global_net = False , fitted_Q = True , fix_seed = True , lr = 1e-4):
+    replay_size = 500000 , PG = False , global_net = False , fitted_Q = True , fix_seed = True , lr = 1e-4 , adaption_test = False , weight_decay = 0.0):
         
 
         super().__init__()
@@ -233,7 +233,12 @@ class Agent(nn.Module):
 
         self.buffer = replay_buffer(replay_size)
         ##
-        self.optimizer = torch.optim.Adam( self.dqn.parameters() , lr = lr , amsgrad=False)
+        if adaption_test:
+            parameters_list =  list(self.dqn.W6.parameters()) +  list(self.dqn.W5.parameters()) + list(self.dqn.W7.parameters()) 
+
+            self.optimizer = torch.optim.Adam( parameters_list , lr = lr , amsgrad=False , weight_decay = weight_decay)
+        else:
+            self.optimizer = torch.optim.Adam(self.dqn.parameters() , lr = lr , weight_decay = weight_decay)
 
         self.loss_func = torch.nn.MSELoss()
 
@@ -243,7 +248,7 @@ class Agent(nn.Module):
 
         self.EPS_END = 0.05
         self.EPS_START = 1.0
-        self.EPS_DECAY = 10000
+        self.EPS_DECAY = 20000
         self.N = 0
         self.N_STEP = 2
         self.PG = PG
@@ -275,7 +280,13 @@ class Agent(nn.Module):
         self.N = 0
         self.selected = []
 
+    def clear_buffer(self):
+        self.buffer.clear_buffer()
 
+    def reset(self):
+        self.clear_buffer()
+        self.steps_done = 0
+        self.episode_done = 0
 
     def take_action(self , graph , Xv , is_validation = False):
         if self.PG:
@@ -303,6 +314,7 @@ class Agent(nn.Module):
                 select_index = (Xv[0].long() == 1).view(-1)
                 val = self.forward(graph , Xv)[0]
                 val[self.selected] = -float('inf')
+                #print(val)
                 action = int(torch.argmax(val).item())
                 self.selected.append(action)
                 self.non_selected.remove(action)
@@ -332,7 +344,7 @@ class Agent(nn.Module):
                 Xv = Xv.to(self.device)
                 val = self.forward(graph , Xv)[0]
                 #val[selected] = -float('inf')
-                print(val)
+                #print(val)
                 #action = int(torch.argmax(val).item())
                 action = self.take_action(graph , Xv , is_validation = True)
                 
@@ -344,7 +356,7 @@ class Agent(nn.Module):
             objective_vals.append(len(self.selected))
         return sum(objective_vals)/len(objective_vals)
     
-    def get_val_result_batch(self , validation_graph):
+    def get_val_result_batch(self , validation_graph , return_list = False):
         N = len(validation_graph)
         all_graphs = []
         all_Xv = []
@@ -387,6 +399,10 @@ class Agent(nn.Module):
         objective_vals = []
         for s in all_selected:
             objective_vals.append(len(s))
+        
+        if return_list:
+            return objective_vals
+
         return sum(objective_vals)/len(objective_vals)
         #del all_graphs,all_Xv
 
@@ -514,7 +530,7 @@ class Agent(nn.Module):
         if  self.episode_done > 0 and self.episode_done %8 == 0:
             #print(self.steps_done)
             self.update_target_network()
-
+    
     def update_target_network(self):
         self.target_net.load_state_dict(self.dqn.state_dict())
 

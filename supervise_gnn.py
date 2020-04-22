@@ -14,6 +14,8 @@ import torch.utils.data as Data
 from copy import deepcopy
 import numpy as np
 from timeit import default_timer as timer
+from DQN_network import Agent
+
 warnings.filterwarnings("ignore")
 
 
@@ -22,10 +24,11 @@ warnings.filterwarnings("ignore")
 
 class gnn_predict_network(nn.Module):
 
-    def __init__(self , emb_dim = 64 , T = 4 , device = 'cuda:0' , init_factor = 10 , w_scale = 0.01 , init_method = 'normal' ):
+    def __init__(self , emb_dim = 64 , T = 4 , device = 'cuda:0' , init_factor = 10 , w_scale = 0.01 , init_method = 'normal' , fix_seed = True):
         super().__init__()
         self.gnn =\
-            embedding_network(emb_dim = emb_dim , T = T,device = device , init_factor = init_factor , w_scale = w_scale , init_method = init_method).double().to(device)
+            embedding_network(emb_dim = emb_dim , T = T,device = device , 
+            init_factor = init_factor , w_scale = w_scale , init_method = init_method , fix_seed = fix_seed).double().to(device)
         
         self.sigmoid = torch.nn.Sigmoid()
 
@@ -35,17 +38,34 @@ class gnn_predict_network(nn.Module):
 
         return self.sigmoid(x)
 
+    def save_weight(self , fname):
+        if 'supervised_model/' not in fname:
+            raise BaseException("need to store in right dir")
 
+        torch.save(self.gnn.state_dict() , fname)
+
+    def get_state_dict(self):
+        return self.gnn.state_dict()
 
 class training_data_generator():
     
-    def __init__(self , original_graph_distribution = ('er' , 0.15) , T = 5 , K = 100 , N = 50 , train_epoch = 10 , num_hint = 10, device = 'cuda:0' , time_report = False):
+    def __init__(self , original_graph_distribution = ('er' , 0.15) , T = 5 , K = 100 , 
+    N = 50 , train_epoch = 10 , num_hint = 10, device = 'cuda:0' , time_report = False , num_modify = 150 , train_on_whole = False , fix_seed = True , uniform_init = False,
+    rand_hint_num = True):
         '''
         T iterations
         K graph per iteration
         N graph size
         '''
-        
+
+        if fix_seed:
+            print('seed fixed')
+            torch.cuda.manual_seed_all(19960214)
+            torch.manual_seed(19960214)
+            np.random.seed(19960214)
+            random.seed(19960214)
+        self.rand_hint_num = rand_hint_num
+        self.train_on_whole = train_on_whole
         self.time_report = time_report
         self.num_hint = num_hint
         self.train_epoch = train_epoch
@@ -56,19 +76,45 @@ class training_data_generator():
         self.offspring = []
         self.ground_truth = []
         self.device = device
+        self.loss_history = []
+        self.val_history = []
         graph_type , p = original_graph_distribution
-        for _ in range(K):
+        self.tmp_agent =  Agent(fix_seed = True , device = device ,fitted_Q=False , replay_size = 1)
+
+        
+        for i in range(K):
             if graph_type == 'er':
+                if uniform_init:
+                    p = random.uniform(0.1,0.5)
                 g = nx.erdos_renyi_graph(n = N , p = p)
+            
+            elif graph_type == 'mix':
+                if i % 2 == 0:
+                    g = nx.erdos_renyi_graph(n = N , p = p)
+                else:
+                    g = nx.barabasi_albert_graph(n = N , m = 4)
+
             else:
                 raise BaseException("No good")
             self.graph_list.append(g)
             #self.ground_truth.append(mvc_bb(g))
-        
+        self.num_modify = num_modify
         self.population = self.graph_list[:]
-        self.gnn_net = gnn_predict_network(device = device).to(device)
 
-    def run_GA(self):
+
+
+    def get_val_result_batch(self , validation_graphs):
+
+        self.tmp_agent.load_weights(state_dict = self.gnn_net.get_state_dict() )
+        res = []
+        for validation_graph in validation_graphs:
+            res.append(self.tmp_agent.get_val_result_batch(validation_graph))
+
+        self.val_history.append(res)
+
+
+
+    def run_GA(self , validation_graphs = None):
         self.network_train()
         for T in range(self.T):
             print("T ",T)
@@ -86,13 +132,20 @@ class training_data_generator():
                 print('selection ',e-s)
             
             self.mutation()
-
+            if self.time_report:
+                s = timer()
+            if validation_graphs is not None:
+                self.get_val_result_batch(validation_graphs)
+                if self.time_report:
+                    e = timer()
+                print('validation ',e-s)
             if self.time_report:
                 s = timer()
             self.network_train()
             if self.time_report:
                 e = timer()
                 print('training ',e-s)
+            
 
     def crossover_two_graph(self , g1 , g2 , pr = 0.5):
 
@@ -109,7 +162,7 @@ class training_data_generator():
 
     def crossover(self):
         self.offspring = []
-        for _ in range(self.K):
+        for _ in range(self.K*2):
             g1 , g2 = random.sample( self.population , 2   )
             new_g = self.crossover_two_graph(g1 , g2)
             self.offspring.append(new_g)
@@ -119,7 +172,7 @@ class training_data_generator():
     
     def mutation_graph(self,  g , num_modify = 150):
         
-        modify_edges = random.randint(-num_modify*.5 , num_modify)
+        modify_edges = random.randint( 0  , num_modify)
 
         nodes = [ i for i in range(len(g.nodes())) ]
 
@@ -191,12 +244,16 @@ class training_data_generator():
         
 
     
-    def get_G_X_target(self , g):
+    def get_G_X_target(self , g , rand_hint_num = False):
         sol = mvc_bb(g)
         env = MVC_environement(g)
         Xv , graph = env.reset_env()
+        K = self.num_hint
+        if rand_hint_num:
+            K = random.randint(0 , len(sol))
+
         if len(sol) >= self.num_hint:
-            idx = np.random.choice(sol , self.num_hint )
+            idx = np.random.choice(sol , K )
         else:
             idx = sol
         graph = torch.unsqueeze(graph , 0)
@@ -208,17 +265,20 @@ class training_data_generator():
     def network_train(self):
         
         loss_fn = torch.nn.BCELoss()
-        optimizer = torch.optim.Adam(self.gnn_net.parameters() , lr = 2e-3)
+        optimizer = torch.optim.Adam(self.gnn_net.parameters() , lr = 1e-4)
 
-        
-        cur_graphs = self.population[:]
+        if self.train_on_whole:
+            cur_graphs = self.graph_list[:]
+        else:
+            cur_graphs = self.population[:]
+        N = len(cur_graphs)
         cur_target = []
         training_targets = []
         training_graphs = []
         training_features = []
         for g in cur_graphs:
             
-            graph , Xv , ans = self.get_G_X_target(g)
+            graph , Xv , ans = self.get_G_X_target(g , rand_hint_num = self.rand_hint_num)
 
             training_graphs.append(graph)
             training_features.append(Xv)
@@ -230,7 +290,7 @@ class training_data_generator():
         #print(training_graphs.shape , training_targets.shape, training_features.shape)
 
         dtset = Data.TensorDataset(training_graphs , training_features , training_targets)
-        loader = Data.DataLoader(dataset = dtset , batch_size = 16 , shuffle = True)
+        loader = Data.DataLoader(dataset = dtset , batch_size = 64 , shuffle = True)
         losses_list = []
         for e in range(self.train_epoch):
             loss_sum = 0
@@ -245,7 +305,16 @@ class training_data_generator():
                 loss.backward()
                 optimizer.step()
                 loss_sum += loss.item()
-            losses_list.append(loss_sum)
-
+            losses_list.append(loss_sum/N)
+        self.loss_history.append(losses_list)
         
         return losses_list
+
+
+    def save_weight(self , fname = 'supervised_model/tmp.pkl'):
+        if 'supervised_model/' not in fname:
+            raise BaseException("need to store in right dir")
+        self.gnn_net.save_weight(fname)
+        #torch.save(self.gnn_net.state_dict() , fname)
+
+    
