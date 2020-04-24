@@ -10,6 +10,9 @@ import math
 import warnings
 from utils import validation 
 from MVC_env import MVC_environement
+from prioritize_replay import PrioritizedReplayBuffer , ReplayBuffer
+from schedules import LinearSchedule
+
 warnings.filterwarnings("ignore")
 
 '''
@@ -207,9 +210,11 @@ class replay_buffer():
     def clear_buffer(self):
         self.size = 0
         self.idx = -1
+
 class Agent(nn.Module):
     def __init__(self , emb_dim = 64 , T = 5,device = 'cuda:0' , init_factor = 10 , w_scale = 0.01 , init_method = 'normal' , 
-    replay_size = 500000 , PG = False , global_net = False , fitted_Q = True , fix_seed = True , lr = 1e-4 , adaption_test = False , weight_decay = 0.0):
+    replay_size = 500000 , PG = False , global_net = False , fitted_Q = True , fix_seed = True , lr = 1e-4 , adaption_test = False , weight_decay = 0.0,
+    prioritize_rp = False , batch_size = 64 , pr_alpha = 0.8):
         
 
         super().__init__()
@@ -231,8 +236,19 @@ class Agent(nn.Module):
 
         self.target_net.load_state_dict(self.dqn.state_dict())
 
-        self.buffer = replay_buffer(replay_size)
+        self.prioritize_rp = prioritize_rp
+        if prioritize_rp:
+            self.buffer = PrioritizedReplayBuffer(size = replay_size , alpha = pr_alpha)
+            self.beta_schedule = LinearSchedule(1000000,
+                                       initial_p=0.4,
+                                       final_p=1.0)
+
+        else:
+            self.buffer = replay_buffer(replay_size)
+
+
         ##
+        self.batch_size = batch_size
         if adaption_test:
             parameters_list =  list(self.dqn.W6.parameters()) +  list(self.dqn.W5.parameters()) + list(self.dqn.W7.parameters()) 
 
@@ -262,6 +278,7 @@ class Agent(nn.Module):
             self.actions = []
             self.dones = []
             self.softmax = torch.nn.Softmax(dim = 1)
+
     def forward(self , graph , Xv ):
         
         if self.device != None:
@@ -411,7 +428,8 @@ class Agent(nn.Module):
     
     
 
-    def train(self , batch_size = 64 , fitted_Q = False) :
+    def train(self   , fitted_Q = False) :
+        batch_size = self.batch_size
         if self.PG:
             R = 0
             rewards_list = []
@@ -441,10 +459,18 @@ class Agent(nn.Module):
             self.dones = []
             self.log_probs = []
         else:
-            if(self.buffer.size < batch_size):
-                return 
-            
-            batch = self.buffer.sample(batch_size)
+            if self.prioritize_rp:
+                if len(self.buffer) < batch_size:
+                    return
+            else:  
+                if(self.buffer.size < batch_size):
+                    return 
+            if self.prioritize_rp:
+                batch , (weights, batch_idxes)   = self.buffer.sample(batch_size , beta = self.beta_schedule.value(self.steps_done))
+                #print(batch)
+            else:
+                batch = self.buffer.sample(batch_size)
+            #print(len(batch),batch)
             batch = experience(*zip(*batch))
             batch_graph = torch.cat(batch.graph)
             batch_state = torch.cat(batch.Xv)
@@ -480,13 +506,16 @@ class Agent(nn.Module):
             expected_q = next_state_value + batch_reward
             loss = self.loss_func(pred_q , expected_q)
 
-            #print(loss)
+            
 
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
-
-
+            if self.prioritize_rp:
+                td_errors =  np.abs(expected_q.cpu().detach() - pred_q.cpu().detach()).numpy()
+                new_priorities = td_errors + 1e-5
+                #print(new_priorities)
+                self.buffer.update_priorities(batch_idxes , new_priorities)
 
     def train_with_graph(self , g ):
 
@@ -521,6 +550,7 @@ class Agent(nn.Module):
                 n_Xv = n_prev_ex.Xv
                 n_action = n_prev_ex.action
                 ex = experience(n_graph , n_Xv , torch.tensor([n_action]) , torch.tensor([n_reward]) , Xv_next , done)
+
                 self.store_transition(ex)
                 fitted_experience_list.pop(0)
                 reward_list.pop(0)

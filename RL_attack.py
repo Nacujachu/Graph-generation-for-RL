@@ -23,7 +23,7 @@ class attack_rl():
 
     def __init__(self,original_graph_distribution = ('er' , 0.15) , T = 5 , K = 100 , 
     N = 50 , train_epoch = 10 , device = 'cuda:1' , time_report = False , num_modify = 150 , train_on_whole = False , fix_seed = True , uniform_init = False,
-    weight_decay = 0.0001):
+    weight_decay = 0.0001 , prioritize_rp = False):
 
         if fix_seed:
             print('seed fixed')
@@ -32,7 +32,7 @@ class attack_rl():
             np.random.seed(19960214)
             random.seed(19960214)
 
-        self.rl_agent = Agent(fix_seed = True,device = device ,fitted_Q = False , replay_size = 500000 , weight_decay = weight_decay).to(device)
+        self.rl_agent = Agent(fix_seed = True,device = device ,fitted_Q = False , replay_size = 500000 , weight_decay = weight_decay , prioritize_rp = prioritize_rp).to(device)
         self.train_on_whole = train_on_whole
         self.graph_list = []
         self.T = T
@@ -110,14 +110,14 @@ class attack_rl():
 
     def simple_generation(self):
         self.offspring = []
-        for _ in range(self.K):
+        for _ in range(2*self.K):
             p = random.uniform(0,1)
             self.offspring.append(nx.erdos_renyi_graph(n = self.N , p = p ) )
         
 
     def network_train(self):
         
-        self.rl_agent.reset()
+        #self.rl_agent.reset()
 
         if self.train_on_whole:
             train_graphs = self.graph_list[:]
