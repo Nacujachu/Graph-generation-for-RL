@@ -5,6 +5,7 @@ import numpy as np
 from collections import namedtuple
 from torch.autograd import Variable
 from GCN import GCN_network
+import torch.nn.functional as F
 import random
 import math
 import warnings
@@ -12,7 +13,7 @@ from utils import validation
 from MVC_env import MVC_environement
 from prioritize_replay import PrioritizedReplayBuffer , ReplayBuffer
 from schedules import LinearSchedule
-
+from copy import deepcopy
 warnings.filterwarnings("ignore")
 
 '''
@@ -59,6 +60,8 @@ class embedding_network_conditional(nn.Module):
         
     def forward(self , graph , Xv ):
         
+
+
         if len(graph.size()) == 2:
             graph = torch.unsqueeze(graph,  0)
     
@@ -132,27 +135,37 @@ class embedding_network(nn.Module):
                 nn.init.normal_(W.weight , 0.0 , w_scale)
             else:
                 nn.init.uniform_(W.weight , -std , std)
-        ##nn.init.uniform_(self.W1.weight , -std, std )
-        #nn.init.uniform_(self.W2.weight, -std, std )
-        #nn.init.uniform_(self.W3.weight, -std, std )
-        #nn.init.uniform_(self.W4.weight, -std, std )
-        #nn.init.uniform_(self.W5.weight, -std, std )
-        #nn.init.uniform_(self.W6.weight, -std, std )
-        #nn.init.uniform_(self.W7.weight, -std, std )
         self.device = device
-        self.relu = nn.ReLU()
+        self.relu = nn.ReLU(inplace = True)
         
     def forward(self , graph , Xv ):
-        
-        if len(graph.size()) == 2:
+        '''
+        Run sparse not implemented yet
+        2020/5/9
+        Done
+        2020/5/11
+        '''
+
+        if 'sparse' in graph.type():
+            run_sparse = True
+            w4_weight = self.W4.weight
+            w3_weight = self.W3.weight
+        else:
+            run_sparse = False
+        if len(graph.size()) == 2 and not run_sparse:
             graph = torch.unsqueeze(graph,  0)
     
         device = self.device
         batch_size = Xv.shape[0]
         n_vertex = Xv.shape[1]
-        graph_edge = torch.unsqueeze(graph , 3)
-        
 
+        if not run_sparse:
+            graph_edge = torch.unsqueeze(graph , 3)
+        else:
+            graph_edge = torch.sparse.sum(graph , 1)
+            graph_edge = graph_edge.unsqueeze((1))
+            #print(graph_edge)
+            #saas
         emb_matrix = torch.zeros([batch_size , n_vertex , self.emb_dim ]).type(torch.DoubleTensor)
         
         if 'cuda' in Xv.type():
@@ -160,12 +173,28 @@ class embedding_network(nn.Module):
                 emb_matrix = emb_matrix.cuda()
             else:
                 emb_matrix = emb_matrix.cuda(device)
+
+
+
         for t in range(self.T):
-            neighbor_sum = torch.bmm(graph , emb_matrix )
+            #print(graph.type() , graph.shape)
+            if 'sparse' in graph.type():
+                neighbor_sum = torch.sparse.mm(graph , emb_matrix[0])
+                neighbor_sum = neighbor_sum.view(batch_size , neighbor_sum.shape[0] , neighbor_sum.shape[1])
+            else:
+                neighbor_sum = torch.bmm(graph , emb_matrix )
+
             v1 = self.W1(Xv)
             v2 = self.W2(neighbor_sum)
-            v3 = self.W4(graph_edge)
-            v3 = self.W3(torch.sum(v3 , 2))
+            if run_sparse:
+                v3 = self.relu(torch.sparse.mm(graph_edge , w4_weight.t()))
+                v3 = torch.sparse.mm(v3 , w3_weight.t())
+                #print(v3)
+                #aaa
+            else:
+                v3 = self.W4(graph_edge)
+                #v3 = self.relu(v3)
+                v3 = self.W3(torch.sum(v3 , 2))
             v = v1 + v2 + v3
             emb_matrix = self.relu(v)
 
@@ -202,8 +231,8 @@ class replay_buffer():
         
         self.buffer[self.idx] = new_exp
     
-    def sample(self , batch_size):
-        batch = np.random.choice(np.arange(self.size) , size = batch_size , replace=False)
+    def sample(self , batch_size , replace = False):
+        batch = np.random.choice(np.arange(self.size) , size = batch_size , replace=replace)
         
         return self.buffer[[batch]]
 
@@ -214,7 +243,7 @@ class replay_buffer():
 class Agent(nn.Module):
     def __init__(self , emb_dim = 64 , T = 5,device = 'cuda:0' , init_factor = 10 , w_scale = 0.01 , init_method = 'normal' , 
     replay_size = 500000 , PG = False , global_net = False , fitted_Q = True , fix_seed = True , lr = 1e-4 , adaption_test = False , weight_decay = 0.0,
-    prioritize_rp = False , batch_size = 64 , pr_alpha = 0.8):
+    prioritize_rp = False , batch_size = 64 , pr_alpha = 0.8 , EPS_DECAY = 20000 , explore_end = 0.05):
         
 
         super().__init__()
@@ -249,22 +278,36 @@ class Agent(nn.Module):
 
         ##
         self.batch_size = batch_size
-        if adaption_test:
-            parameters_list =  list(self.dqn.W6.parameters()) +  list(self.dqn.W5.parameters()) + list(self.dqn.W7.parameters()) 
+        self.adaption_test = adaption_test
+        self.adaption_buffer = PrioritizedReplayBuffer(20000 , alpha = .99)
+        self.adaption_schedule = LinearSchedule(20000,
+                                       initial_p=0.4,
+                                       final_p=1.0)
+        #if adaption_test:
+        #    self.train_all = False
+        #    self.train_encoder = True
+        #    self.train_decoder = False
+        enc_parameters_list = list(self.dqn.W1.parameters()) + list(self.dqn.W2.parameters()) + list(self.dqn.W3.parameters()) + list(self.dqn.W4.parameters()) +list(self.dqn.W6.parameters())  
 
-            self.optimizer = torch.optim.Adam( parameters_list , lr = lr , amsgrad=False , weight_decay = weight_decay)
-        else:
-            self.optimizer = torch.optim.Adam(self.dqn.parameters() , lr = lr , weight_decay = weight_decay)
+        dec_parameters_list = list(self.dqn.W5.parameters()) + list(self.dqn.W7.parameters())  
+
+        self.enc_optimizer = torch.optim.Adam( enc_parameters_list , lr = lr , amsgrad=False , weight_decay = weight_decay)
+        self.dec_optimizer = torch.optim.Adam( dec_parameters_list , lr = 5e-6 , amsgrad=False , weight_decay = 0.0005)
+            
+            #self.optimizer = torch.optim.Adam( parameters_list , lr = lr , amsgrad=False , weight_decay = weight_decay)
+        #else:
+        self.train_all = True
+        self.optimizer = torch.optim.Adam(self.dqn.parameters() , lr = lr , weight_decay = weight_decay)
 
         self.loss_func = torch.nn.MSELoss()
 
         self.device = device
 
-        self.steps_done = 0
-
-        self.EPS_END = 0.05
+        self.steps_done = 0 
+        self.adaption_steps = 0
+        self.EPS_END = explore_end
         self.EPS_START = 1.0
-        self.EPS_DECAY = 20000
+        self.EPS_DECAY = EPS_DECAY
         self.N = 0
         self.N_STEP = 2
         self.PG = PG
@@ -297,11 +340,17 @@ class Agent(nn.Module):
         self.N = 0
         self.selected = []
 
+    def flip_parameter(self):
+        if self.adaption_test:
+            self.train_encoder = not self.train_encoder
+            self.train_decoder = not self.train_decoder
+
     def clear_buffer(self):
         self.buffer.clear_buffer()
 
-    def reset(self):
-        self.clear_buffer()
+    def reset(self , buffer_clear = False):
+        if buffer_clear:
+            self.clear_buffer()
         self.steps_done = 0
         self.episode_done = 0
 
@@ -326,6 +375,10 @@ class Agent(nn.Module):
             rand_val = np.random.uniform()
             if is_validation:
                 rand_val = 999
+
+            #if self.adaption_test:
+            #    eps_threshold = 0.5
+            
             #print(is_validation , rand_val)
             if  rand_val > eps_threshold  :
                 select_index = (Xv[0].long() == 1).view(-1)
@@ -343,41 +396,77 @@ class Agent(nn.Module):
             if(is_validation == False):
                 self.steps_done = self.steps_done + 1
             return action
-    def get_val_result(self, validation_graph):
+    def get_val_result(self, validation_graph , run_sparse = False):
+
+
+        if type(validation_graph) is not list:
+            validation_graph = [validation_graph]
 
         objective_vals = []
         for g in validation_graph:
             env = MVC_environement(g)
             Xv , graph = env.reset_env()
-            graph = torch.unsqueeze(graph,  0)
+            if run_sparse:
+                assert len(validation_graph) == 1
+                #graph = torch.unsqueeze(graph,  0)
+                graph = to_sparse_tensor(graph)
+            else:
+                graph = torch.unsqueeze(graph,  0)
             Xv = Xv.clone()
-            Xv = Xv.cuda()
+            if 'cuda' in self.device:
+                Xv = Xv.cuda()
             graph = graph.to(self.device)
             done = False
             self.non_selected = list(np.arange(env.num_nodes))
             self.selected = []
             while done == False:
+                #Xvprint(len(self.selected))
                 #Xv = Xv.cuda()
                 Xv = Xv.to(self.device)
-                val = self.forward(graph , Xv)[0]
-                #val[selected] = -float('inf')
-                #print(val)
-                #action = int(torch.argmax(val).item())
+                if run_sparse:
+                    val = self.forward(graph , Xv)
+                else:
+                    val = self.forward(graph , Xv)[0]
                 action = self.take_action(graph , Xv , is_validation = True)
                 
                 Xv_next , reward , done = env.take_action(action)
-                #non_selected.remove(action)
-                #selected.append(action)
                 Xv = Xv_next
             #print(selected)
             objective_vals.append(len(self.selected))
         return sum(objective_vals)/len(objective_vals)
     
-    def get_val_result_batch(self , validation_graph , return_list = False):
+
+    def batch_adaption(self , validation_graph , adap_iter = 20):
+        try:
+            self.adaption_steps = 0
+            self.save_weights('rl_attack_model/adaption_tmp.pkl')
+            self.update_target_network()
+
+            for i in range(adap_iter):
+                self.get_val_result_batch(validation_graph , during_adaption = True)
+
+
+
+            ret_ls = self.get_val_result_batch(validation_graph , return_list = False, during_adaption = False)
+            self.adaption_steps = 0
+            self.adaption_buffer.clear_buffer()
+            self.load_weights(file_name = 'rl_attack_model/adaption_tmp.pkl')
+            return ret_ls
+        finally:
+            self.adaption_steps = 0
+            self.adaption_buffer.clear_buffer()
+            self.load_weights(file_name = 'rl_attack_model/adaption_tmp.pkl')
+            
+    def get_val_result_batch(self , validation_graph , return_list = False , during_adaption = False):
         N = len(validation_graph)
+        N_STEP = 2
         all_graphs = []
         all_Xv = []
         all_envs = []
+        
+
+        fitted_experience_list = [[] for _ in range(N)]
+
         for g in validation_graph:
             env = MVC_environement(g)
             all_envs.append(env)
@@ -391,6 +480,7 @@ class Agent(nn.Module):
         all_dones = [False for _ in range(N)]
         all_done = False
         done_count = 0
+        cur_step = 0
         while all_done == False:
             q_val = self.dqn(all_graphs , all_Xv )
             for i in range(N):
@@ -400,14 +490,58 @@ class Agent(nn.Module):
 
                 q_val[i][ all_selected[i] ] = -float('inf')
                 action = torch.argmax(q_val[i]).item()
+                if during_adaption:
+                    rand_val = random.uniform(0 , 1)
+                    if rand_val >0:
+                        probs = torch.nn.functional.softmax(q_val[i])
+                        m = torch.distributions.categorical.Categorical(probs = probs)
+                        action = m.sample().item()
+                    #print(m,action)
                 all_selected[i].append(action)
-                _,_,done = all_envs[i].take_action(action)
+                Xv_next,rew,done = all_envs[i].take_action(action)
+
+                if during_adaption:
+                    copy_xv = deepcopy(all_Xv[i:i+1])
+                    fit_ex = fitted_q_exp(all_graphs[i:i+1] , copy_xv , action , rew)
+                    fitted_experience_list[i].append(fit_ex)
+                    if len(fitted_experience_list[i]) >= N_STEP:
+                        
+                        n_reward = -N_STEP
+                        n_prev_ex = fitted_experience_list[i][0]
+                        n_graph = n_prev_ex.graph
+                        n_Xv = n_prev_ex.Xv
+                        #print( sum(n_Xv[0]) , sum(Xv_next[0]))
+                        #zz
+                        n_action = n_prev_ex.action
+                        ex = experience(n_graph , n_Xv , torch.tensor([n_action]) , torch.tensor([n_reward]) , Xv_next , done)
+                        self.adaption_buffer.push(ex)
+                        #print(len(self.adaption_buffer))
+                        fitted_experience_list[i].pop(0)
+                    #ex = experience( all_graphs[i:i+1] , deepcopy(all_Xv[i:i+1]) , torch.tensor([action]) , torch.tensor([-1]) , Xv_next , done)
+                    #self.adaption_buffer.push(ex)
+                    #print(len(self.adaption_buffer))
+                    #self.train(during_adaption = True , fitted_Q = True)
+
                 all_Xv[i][action] = 1
                 if done:
                     all_dones[i] = True
                     done_count += 1
+                self.adaption_steps += 1
+            cur_step += 1
+            if during_adaption and cur_step >= N_STEP+1:
+                #print(len(self.adaption_buffer))
+                for ep in range(20):
+                    self.train(during_adaption = True , fitted_Q = False , batch_size = 128)
+                self.update_target_network()
+            
             if(done_count == N):
                 break
+            
+            #if during_adaption:
+            #    for zz in range(N):
+            #        self.train(during_adaption = True , fitted_Q = False)
+            #        if zz % 10 == 0:
+            #            self.update_target_network()
             #print(all_Xv)
             #print(q_val.shape)
             #del all_graphs
@@ -428,8 +562,9 @@ class Agent(nn.Module):
     
     
 
-    def train(self   , fitted_Q = False) :
-        batch_size = self.batch_size
+    def train(self   , fitted_Q = False , during_adaption = False , batch_size = None) :
+        if batch_size is None:
+            batch_size = self.batch_size
         if self.PG:
             R = 0
             rewards_list = []
@@ -459,26 +594,32 @@ class Agent(nn.Module):
             self.dones = []
             self.log_probs = []
         else:
-            if self.prioritize_rp:
-                if len(self.buffer) < batch_size:
-                    return
-            else:  
-                if(self.buffer.size < batch_size):
-                    return 
-            if self.prioritize_rp:
-                batch , (weights, batch_idxes)   = self.buffer.sample(batch_size , beta = self.beta_schedule.value(self.steps_done))
-                #print(batch)
+
+            if during_adaption:
+                batch , (weights, batch_idxes) = self.adaption_buffer.sample(batch_size , beta = self.adaption_schedule.value(self.adaption_steps) )
             else:
-                batch = self.buffer.sample(batch_size)
+                if self.prioritize_rp:
+                    if len(self.buffer) < batch_size:
+                        return
+                else:  
+                    if(self.buffer.size < batch_size):
+                        return 
+                if self.prioritize_rp:
+                    batch , (weights, batch_idxes)   = self.buffer.sample(batch_size , beta = self.beta_schedule.value(self.steps_done))
+                    #print(batch)
+                else:
+                    batch = self.buffer.sample(batch_size)
             #print(len(batch),batch)
+            
             batch = experience(*zip(*batch))
             batch_graph = torch.cat(batch.graph)
             batch_state = torch.cat(batch.Xv)
             batch_action = torch.cat(batch.action)
             batch_reward = torch.cat(batch.reward).double()
             batch_next_state = torch.cat(batch.next_Xv)
+            
             non_final_mask = torch.tensor(tuple(map(lambda s : s is not True, batch.is_done)),dtype = torch.uint8)
-
+            
             non_final_graph = batch_graph[non_final_mask]
             non_final_next_state = batch_next_state[non_final_mask]
 
@@ -507,15 +648,41 @@ class Agent(nn.Module):
             loss = self.loss_func(pred_q , expected_q)
 
             
+            #if self.adaption_test == False:
+            if not during_adaption:
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+            else:
+                #self.optimizer.zero_grad()
+                #loss.backward()
+                #self.optimizer.step()
+                self.dec_optimizer.zero_grad()
+                loss.backward()
+                self.dec_optimizer.step()
+                #if during_adaption:
+                #self.dec_optimizer.zero_grad()
+                #loss.backward()
+                #self.dec_optimizer.step()
+                #if during_adaption or self.train_decoder:
+                #    self.dec_optimizer.zero_grad()
+                #    loss.backward()
+                #    self.dec_optimizer.step()
+                #else:
+                #    self.enc_optimizer.zero_grad()
+                #    loss.backward()
+                #    self.enc_optimizer.step()
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            if self.prioritize_rp:
+            if self.prioritize_rp and not during_adaption:
                 td_errors =  np.abs(expected_q.cpu().detach() - pred_q.cpu().detach()).numpy()
                 new_priorities = td_errors + 1e-5
                 #print(new_priorities)
                 self.buffer.update_priorities(batch_idxes , new_priorities)
+            
+            if during_adaption:
+                td_errors =  np.abs(expected_q.cpu().detach() - pred_q.cpu().detach()).numpy()
+                new_priorities = td_errors + 1e-5
+                self.adaption_buffer.update_priorities(batch_idxes , new_priorities)
 
     def train_with_graph(self , g ):
 
@@ -549,6 +716,9 @@ class Agent(nn.Module):
                 n_graph = n_prev_ex.graph
                 n_Xv = n_prev_ex.Xv
                 n_action = n_prev_ex.action
+
+                #print(sum(n_Xv[0]) , sum(Xv_next[0]))
+                #aa
                 ex = experience(n_graph , n_Xv , torch.tensor([n_action]) , torch.tensor([n_reward]) , Xv_next , done)
 
                 self.store_transition(ex)

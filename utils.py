@@ -14,6 +14,23 @@ def pickle_load(file_name):
 
 
 
+def edgelist2nxGraph(file_name):
+    edges = []
+    graph = nx.Graph()
+    with open(file_name , 'r') as f:
+        lines = f.readlines()
+    for l in lines:
+        a , b = l.strip('\n').split(' ')
+        a = int(a)
+        b = int(b)
+        graph.add_nodes_from([a,b])
+        graph.add_edge(a,b)
+    graph.remove_edges_from(nx.selfloop_edges(graph))
+    return graph
+
+
+def density2regD(n  , density):
+    return math.floor(n*density)
 
 def density_to_edge_ba(n , p):
     return math.ceil( p *n  /2)
@@ -29,7 +46,14 @@ def validation_graph_gen(n , p , num = 100, graph_type = 'er'):
             m = density_to_edge_ba(n , p)
             g = nx.barabasi_albert_graph(n , m)
             validation_graph.append(g)
-            
+        elif graph_type == 'reg':
+            d = density2regD(n , p)
+            g = nx.random_regular_graph(n = n , d = d)
+            validation_graph.append(g)
+        elif graph_type == 'pow':
+            m = density_to_edge_ba(n , p)
+            g = nx.powerlaw_cluster_graph(n = n , m = m , p = 0.25)
+            validation_graph.append(g)
     return validation_graph
 
 def get_lap_torch(g):
@@ -73,7 +97,27 @@ def is_vertex_cover(graph , cover):
             
     return cover_edge == total_edge
 
-def mvc_bb(graph , UB = 9999999 , C = []):
+
+def greedy2approx(graph):
+    
+    covered_edge = 0
+    num_edge = len(graph.edges())
+    hd = heapdict()
+    degree = nx.degree(graph)
+    for v , d in degree:
+        hd[v] = -d
+        
+    select_nodes = set()
+    
+    while covered_edge < num_edge:
+        cur_v , cur_deg = hd.popitem()
+        select_nodes.add(cur_v)
+        covered_edge += -(cur_deg)
+        for u in graph.neighbors(cur_v):
+            if u not in select_nodes:
+                hd[u] += 1
+    return select_nodes
+def mvc_bb(graph , UB = 9999999 , C = [] , use_deg_lb = False):
     
     def DegLB():
     
@@ -95,6 +139,7 @@ def mvc_bb(graph , UB = 9999999 , C = []):
                     continue
                 hd[u] += 1
         cur_v , cur_degree = hd.popitem()
+        cur_degree = -cur_degree
         graph_plum = graph.copy()
         graph_plum.remove_nodes_from(select_nodes)
         E_plum = len(graph_plum.edges())
@@ -106,8 +151,10 @@ def mvc_bb(graph , UB = 9999999 , C = []):
     if len(graph.edges()) == 0:
         #return len(C)
         return C
-    #LB = DegLB()
-    LB = 0
+    if use_deg_lb:
+        LB = DegLB()
+    else:
+        LB = 0
     if len(C) + LB >= UB:
         #return UB
         return [i for i in range(UB+1)]
